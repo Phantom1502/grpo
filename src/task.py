@@ -27,6 +27,7 @@ class Trajectory:
     rewards: list              # reward thô từng step (float)
     states: list                # state tensor thô (cpu, không gradient) từng step
     actions: list                # action (int) đã chọn từng step
+    log_probs: list             # log_prob (float) của action đã chọn từng step
     duration: int
     success: bool                # task có hoàn thành theo tiêu chí riêng của domain hay không
     info: dict = field(default_factory=dict)  # metadata tự do (vd: điểm số Atari, lý do fail...)
