@@ -53,24 +53,18 @@ class GroupSampler:
         obs, _ = self.task.reset()
         state = self.obs_to_tensor(obs, self.device)
 
-        states, actions, rewards, log_probs = [], [], [], []
+        states, actions, rewards = [], [], []
         terminated = truncated = False
         last_info = {}
 
         for _ in range(self.task.max_steps):
-            action, log_prob, _entropy = self.policy.get_action(state.unsqueeze(0))
-            
-            # Bỏ batch dimension: 
-            # action: scalar (discrete) hoặc (action_dim,) (continuous)
-            # log_prob: scalar tensor ()
-            action = action.squeeze(0)
-            log_prob = log_prob.squeeze(0)
+            action, _log_prob, _entropy = self.policy.get_action(state.unsqueeze(0))
+            action = action.squeeze(0)  # bo batch dim: scalar (discrete) hoac (action_dim,) (continuous)
 
             next_obs, reward, terminated, truncated, info = self.task.step(action_to_env(action))
 
             states.append(state.cpu())
             actions.append(action.detach().cpu())
-            log_probs.append(log_prob.detach().cpu())  # Lưu log_prob đã detach xuống CPU
             rewards.append(reward)
             last_info = info
 
@@ -86,7 +80,6 @@ class GroupSampler:
             rewards=rewards,
             states=states,
             actions=actions,
-            log_probs=log_probs,  # Thêm log_probs vào Trajectory
             duration=duration,
             success=success,
             info=last_info,

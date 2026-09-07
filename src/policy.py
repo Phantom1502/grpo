@@ -129,7 +129,17 @@ class GaussianMLPPolicy(BasePolicy):
 
     def forward(self, x):
         h = self.net(x)
-        return self.mean_head(h)
+        raw_mean = self.mean_head(h)
+        # QUAN TRỌNG: bound MEAN bằng tanh ngay tại đây (không phải bound action
+        # sau khi sample). Nếu để raw_mean tự do không giới hạn, sau nhiều lần
+        # update liên tiếp cùng hướng (dễ xảy ra khi review lại các đoạn cũ nhiều
+        # lần), trọng số mean_head có thể bị đẩy mạnh khiến raw_mean chạy ra rất
+        # xa [-1,1]. Bound mean bằng tanh khiến nó KHÔNG BAO GIỜ vượt quá (-1,1)
+        # dù trọng số lớn cỡ nào -- và vì đạo hàm tanh tự giảm dần khi bão hoà,
+        # bản thân việc tối ưu cũng tự kìm hãm không đẩy trọng số lớn thêm vô ích
+        # (self-limiting), khác hẳn với để raw_mean tự do rồi mới clamp/squash
+        # action sau cùng (dễ gây "khoá cứng hành vi" như quan sát thực tế).
+        return torch.tanh(raw_mean)
 
     def get_distribution(self, x):
         mean = self.forward(x)
@@ -138,7 +148,7 @@ class GaussianMLPPolicy(BasePolicy):
         return TransformedDistribution(base, [TanhTransform(cache_size=1)])
 
     def get_action(self, state, deterministic: bool = False):
-        mean = self.forward(state)
+        mean = self.forward(state)  # đã bound trong (-1,1) từ forward()
         std = torch.exp(self.log_std).expand_as(mean)
         base = Independent(Normal(mean, std), 1)
         dist = TransformedDistribution(base, [TanhTransform(cache_size=1)])
@@ -148,14 +158,10 @@ class GaussianMLPPolicy(BasePolicy):
         else:
             pre_tanh = base.rsample()
 
-        # QUAN TRỌNG: clamp giá trị TRƯỚC khi qua tanh (không phải sau). Nếu để
-        # mean_head cho ra giá trị quá lớn (vd bị đẩy mạnh sau nhiều lần update
-        # liên tiếp -- dễ xảy ra khi review lại các đoạn cũ nhiều lần), tanh() ở
-        # float32 sẽ làm tròn về ĐÚNG 1.0 khi |x| >= ~10, khiến atanh(1.0) = inf
-        # lúc tính lại log_prob (TransformedDistribution cần atanh để lấy log-det
-        # Jacobian) -- toàn bộ log_prob/entropy nổ tung thành NaN/số vô nghĩa.
-        # Clamp trước tanh với biên an toàn (|x|<=6, tanh(6)~0.9999877, còn xa 1.0)
-        # tránh lỗi số học này mà không cần đụng tới giá trị action sau squash.
+        # Lưới an toàn số học: mean đã bound trong (-1,1), nhưng nhiễu Gaussian
+        # (std) vẫn có thể đẩy sample ra khá xa ở phần đuôi phân phối nếu std bị
+        # học lớn. Clamp nhẹ trước tanh (biên rộng, hiếm khi chạm tới trong vận
+        # hành bình thường) để tránh atanh(±1)=inf ở float32 khi |pre_tanh|>=10.
         pre_tanh = torch.clamp(pre_tanh, -6.0, 6.0)
         action = torch.tanh(pre_tanh)
 

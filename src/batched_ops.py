@@ -26,29 +26,28 @@ def recompute_log_probs_and_entropy(
     all_states = torch.stack(
         [s for traj in trajectories for s in traj.states]
     ).to(device)
-    
+    # actions da duoc luu dung dtype/shape tu luc sample (long cho discrete,
+    # float vector cho continuous) -- chi can stack lai, khong ep kieu thu cong.
     all_actions = torch.stack(
         [a for traj in trajectories for a in traj.actions]
     ).to(device)
 
-    # Batched Forward duy nhất cho toàn bộ states
     dist = policy.get_distribution(all_states)
     log_probs = dist.log_prob(all_actions)
 
-    # Xử lý Entropy (Closed-form hoặc Fallback qua -log_prob)
+    # TransformedDistribution (Tanh-Squashed Gaussian) khong co entropy() dang
+    # dong vi TanhTransform phi tuyen -- fallback sang uoc luong qua -log_prob
+    # (cach chuan trong SAC). Categorical/Independent(Normal) thi dung entropy()
+    # dong san co, chinh xac hon.
     if getattr(policy, "has_closed_form_entropy", True):
         entropies = dist.entropy()
     else:
         entropies = -log_probs
 
-    # --------------------------------------------------------------------------
-    # THAY ĐỔI THEN CHỐT:
-    # Trả về Danh sách Tensor 1D log_prob từng step [T_i] thay vì scalar sum
-    # --------------------------------------------------------------------------
-    log_probs_per_step = list(torch.split(log_probs, lengths))
+    log_prob_sums = [lp.sum() for lp in torch.split(log_probs, lengths)]
     entropy_means = [e.mean() for e in torch.split(entropies, lengths)]
+    return log_prob_sums, entropy_means
 
-    return log_probs_per_step, entropy_means
 
 def batched_kl_penalty(policy, reference_policy, trajectories, device: torch.device) -> torch.Tensor:
     """KL penalty (k3 estimator, Schulman) giua policy hien tai va reference,
