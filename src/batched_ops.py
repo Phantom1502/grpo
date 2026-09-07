@@ -34,7 +34,15 @@ def recompute_log_probs_and_entropy(
 
     dist = policy.get_distribution(all_states)
     log_probs = dist.log_prob(all_actions)
-    entropies = dist.entropy()
+
+    # TransformedDistribution (Tanh-Squashed Gaussian) khong co entropy() dang
+    # dong vi TanhTransform phi tuyen -- fallback sang uoc luong qua -log_prob
+    # (cach chuan trong SAC). Categorical/Independent(Normal) thi dung entropy()
+    # dong san co, chinh xac hon.
+    if getattr(policy, "has_closed_form_entropy", True):
+        entropies = dist.entropy()
+    else:
+        entropies = -log_probs
 
     log_prob_sums = [lp.sum() for lp in torch.split(log_probs, lengths)]
     entropy_means = [e.mean() for e in torch.split(entropies, lengths)]
