@@ -130,16 +130,22 @@ class GaussianMLPPolicy(BasePolicy):
     def forward(self, x):
         h = self.net(x)
         raw_mean = self.mean_head(h)
-        # QUAN TRỌNG: bound MEAN bằng tanh ngay tại đây (không phải bound action
-        # sau khi sample). Nếu để raw_mean tự do không giới hạn, sau nhiều lần
-        # update liên tiếp cùng hướng (dễ xảy ra khi review lại các đoạn cũ nhiều
-        # lần), trọng số mean_head có thể bị đẩy mạnh khiến raw_mean chạy ra rất
-        # xa [-1,1]. Bound mean bằng tanh khiến nó KHÔNG BAO GIỜ vượt quá (-1,1)
-        # dù trọng số lớn cỡ nào -- và vì đạo hàm tanh tự giảm dần khi bão hoà,
-        # bản thân việc tối ưu cũng tự kìm hãm không đẩy trọng số lớn thêm vô ích
-        # (self-limiting), khác hẳn với để raw_mean tự do rồi mới clamp/squash
-        # action sau cùng (dễ gây "khoá cứng hành vi" như quan sát thực tế).
-        return torch.tanh(raw_mean)
+        # SỬA LẠI: dùng clamp thay vì tanh ở đây. Bound mean bằng tanh (thử
+        # trước đó) gây tác dụng phụ nghiêm trọng: mean đã bị squash 1 lần rồi
+        # còn bị TanhTransform bên ngoài squash THÊM 1 lần nữa (2 lớp tanh liên
+        # tiếp) -- kết quả là action THỰC THI gần như không bao giờ vươn tới
+        # gần +-1 được nữa (đo thực nghiệm: chỉ ~16% action vượt 0.9 dù mean đã
+        # "cố hết sức" = 0.9, so với ~99% của thiết kế 1 lớp tanh chuẩn). Policy
+        # mất khả năng hành động quyết đoán (mua/bán mạnh) -- chính là nguyên
+        # nhân reward đứng yên phẳng lì dù chạy rất nhiều iteration.
+        #
+        # clamp() KHÔNG làm méo giá trị bên trong biên (identity map trong
+        # [-clip_mean, clip_mean]), chỉ tự giới hạn khi vượt ngưỡng -- giữ
+        # nguyên độ biểu đạt của raw_mean trong vùng bình thường, đồng thời vẫn
+        # ngăn được runaway (không thể vượt quá clip_mean dù trọng số lớn cỡ
+        # nào) và vẫn đảm bảo an toàn số học cho TanhTransform bên ngoài (biên
+        # 6.0 giữ tanh() không bao giờ làm tròn về đúng 1.0 ở float32).
+        return torch.clamp(raw_mean, -6.0, 6.0)
 
     def get_distribution(self, x):
         mean = self.forward(x)
