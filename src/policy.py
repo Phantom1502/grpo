@@ -8,7 +8,8 @@ get_action() dung chung, khong can override rieng cho tung loai policy.
 
 import torch
 import torch.nn as nn
-from torch.distributions import Categorical, Independent, Normal
+from torch.distributions import Categorical, Independent, Normal, TransformedDistribution
+from torch.distributions.transforms import TanhTransform
 
 
 class BasePolicy(nn.Module):
@@ -88,16 +89,24 @@ class GaussianMLPPolicy(BasePolicy):
     Continuous action, observation dang vector -- dung cho Box action space
     (vd: finrl StockTradingEnv, MuJoCo, robot dieu khien lien tuc...).
 
-    Dung Gaussian doc lap theo tung chieu action (state-independent log_std,
-    kieu tiep can pho bien trong PPO continuous-control). action duoc clamp ve
-    dung [action_low, action_high] SAU khi sample.
+    Dung Tanh-Squashed Gaussian (kieu SAC) thay vi Gaussian tho + clamp don
+    gian. LY DO QUAN TRONG: neu chi sample tu Gaussian khong bi chan roi
+    clamp(action, low, high) SAU cung (cach lam truoc day), khi mean bi day ra
+    xa khoi [-1,1] (vi du do trong so mean_head bi cung co qua manh qua nhieu
+    lan update lien tiep -- rat de xay ra khi review lai cac doan cu nhieu
+    lan), MOI rollout deu bi clamp ve dung 1 gia tri bien -> action thuc thi
+    ra moi truong gan nhu XAC DINH du entropy cua Gaussian goc (truoc clamp)
+    van hien thi binh thuong khong doi. Day la "diem mu" khien group tro nen
+    degenerate (khong con gradient signal) MA KHONG HE THAY canh bao qua log
+    entropy, va policy bi "khoa cung" vinh vien o dung 1 hanh vi cho moi state
+    moi gap phai -- day chinh la trieu chung "hoc rat cham/dung hinh" khi
+    curriculum chuyen sang doan moi.
 
-    LUU Y (caveat quan trong): vi action bi clamp sau khi sample tu Gaussian
-    khong bi chan, log_prob dung de tinh gradient la log_prob cua gia tri DA
-    CLAMP duoi phan phoi Gaussian goc -- day la xap xi don gian hoa, khong hoan
-    toan chinh xac ve mat ly thuyet nhu tanh-squashed Gaussian (kieu SAC). Neu
-    can chinh xac hon (dac biet khi policy hay sample ra gia tri vuot bien),
-    nen thay bang TransformedDistribution voi TanhTransform.
+    Tanh-Squashed Gaussian giai quyet dung goc: log_prob/entropy duoc tinh
+    TREN PHAN PHOI DA SQUASH (qua TransformedDistribution + TanhTransform,
+    tu dong cong dao ham Jacobian dung chuan), nen khi sap bao hoa, entropy
+    THAT giam manh (am rat sau) -- entropy_coef luc nay moi phat huy dung tac
+    dung "phanh" lai truoc khi bi khoa cung, thay vi vo tri nhu Gaussian+clamp.
     """
 
     def __init__(self, n_observations: int, action_dim: int, hidden: int = 128,
@@ -113,6 +122,10 @@ class GaussianMLPPolicy(BasePolicy):
         self.log_std = nn.Parameter(torch.ones(action_dim) * log_std_init)
         self.action_low = action_low
         self.action_high = action_high
+        # TransformedDistribution khong co .entropy() dang dong (vi TanhTransform
+        # phi tuyen) -- danh dau de batched_ops biet fallback sang uoc luong
+        # entropy qua -log_prob(action) (cach chuan trong cac implementation SAC).
+        self.has_closed_form_entropy = False
 
     def forward(self, x):
         h = self.net(x)
@@ -121,17 +134,32 @@ class GaussianMLPPolicy(BasePolicy):
     def get_distribution(self, x):
         mean = self.forward(x)
         std = torch.exp(self.log_std).expand_as(mean)
-        return Independent(Normal(mean, std), 1)
+        base = Independent(Normal(mean, std), 1)
+        return TransformedDistribution(base, [TanhTransform(cache_size=1)])
 
     def get_action(self, state, deterministic: bool = False):
-        dist = self.get_distribution(state)
-        action_sample = dist.mean if deterministic else dist.sample()
-        
-        # Tính log_prob & entropy trên sample THỰC TẾ trước khi bị clamp
-        log_prob = dist.log_prob(action_sample)
-        entropy = dist.entropy()
-        
-        # Giới hạn action để gửi vào FinRL Environment
-        clamped_action = torch.clamp(action_sample, self.action_low, self.action_high)
-        
-        return clamped_action, log_prob, entropy
+        mean = self.forward(state)
+        std = torch.exp(self.log_std).expand_as(mean)
+        base = Independent(Normal(mean, std), 1)
+        dist = TransformedDistribution(base, [TanhTransform(cache_size=1)])
+
+        if deterministic:
+            pre_tanh = mean
+        else:
+            pre_tanh = base.rsample()
+
+        # QUAN TRỌNG: clamp giá trị TRƯỚC khi qua tanh (không phải sau). Nếu để
+        # mean_head cho ra giá trị quá lớn (vd bị đẩy mạnh sau nhiều lần update
+        # liên tiếp -- dễ xảy ra khi review lại các đoạn cũ nhiều lần), tanh() ở
+        # float32 sẽ làm tròn về ĐÚNG 1.0 khi |x| >= ~10, khiến atanh(1.0) = inf
+        # lúc tính lại log_prob (TransformedDistribution cần atanh để lấy log-det
+        # Jacobian) -- toàn bộ log_prob/entropy nổ tung thành NaN/số vô nghĩa.
+        # Clamp trước tanh với biên an toàn (|x|<=6, tanh(6)~0.9999877, còn xa 1.0)
+        # tránh lỗi số học này mà không cần đụng tới giá trị action sau squash.
+        pre_tanh = torch.clamp(pre_tanh, -6.0, 6.0)
+        action = torch.tanh(pre_tanh)
+
+        log_prob = dist.log_prob(action)
+        entropy = -log_prob  # uoc luong entropy qua -log_prob (TransformedDistribution
+        # khong co entropy() dang dong) -- day la cach lam chuan trong SAC.
+        return action, log_prob, entropy
