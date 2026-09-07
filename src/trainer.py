@@ -50,51 +50,65 @@ class GRPOTrainer:
                 p.requires_grad_(False)
 
     def train_step(self):
+        # 1. Thu thập dữ liệu từ Sampler
         trajectories = self.sampler.collect_group()
+        if len(trajectories) == 0:
+            return {}
+
         rewards = torch.tensor(
-            [t.total_reward for t in trajectories], dtype=torch.float32, device=self.device
+            [t.total_reward for t in trajectories],
+            dtype=torch.float32,
+            device=self.device,
         )
         degenerate = is_degenerate_group(rewards)
         advantages = compute_advantage(rewards, method=self.config.advantage_method)
 
-        # Recompute log_probs từng step và entropy
-        # Lưu ý: recompute cần trả về log_probs dạng List[Tensor] (mỗi Tensor shape [T_i] chứa log_prob từng step)
+        # 2. Lấy old_log_probs đã được tính sẵn tại thời điểm Rollout/Sampling
+        # Đảm bảo old_log_probs là danh sách các Tensor 1D [T_i] detached trên đúng device
+        old_log_probs_per_step = [
+            torch.tensor(t.log_probs, dtype=torch.float32, device=self.device)
+            if not isinstance(t.log_probs, torch.Tensor)
+            else t.log_probs.detach().to(self.device)
+            for t in trajectories
+        ]
+
+        # 3. Recompute log_probs và entropy của Policy hiện tại
         log_probs_per_step, entropy_means = recompute_log_probs_and_entropy(
             self.policy, trajectories, self.device
         )
 
-        # --------------------------------------------------------------------------
-        # CHẶN GRADIENT THEO TỪNG ACTION (PER-ACTION GRADIENT CLIPPING)
-        # --------------------------------------------------------------------------
-        # Đặt ngưỡng log_prob (Có thể cấu hình trong config)
+        # 4. Đọc các siêu tham số cấu hình (Hyperparameters)
+        EPSILON = getattr(self.config, "ppo_epsilon", 0.2)
         LOG_PROB_MAX = getattr(self.config, "log_prob_max", -0.05)  # ~95% confidence
         LOG_PROB_MIN = getattr(self.config, "log_prob_min", -4.00)  # ~1.8% confidence
 
         policy_loss_terms = []
 
-        for step_log_probs, adv in zip(log_probs_per_step, advantages):
-            # 1. Chỉ BỊ CHẶN khi: Đã cao (> MAX) VÀ vẫn cố đẩy TĂNG (adv > 0)
+        # 5. Vòng lặp tính PPO Loss + Gradient Masking theo từng Trajectory / Step
+        for step_log_probs, old_log_probs, adv in zip(
+            log_probs_per_step, old_log_probs_per_step, advantages
+        ):
+            # r_t = exp(log_pi_new - log_pi_old)
+            ratio = torch.exp(step_log_probs - old_log_probs)
+
+            # PPO Clipped Loss
+            surr1 = ratio * adv
+            surr2 = torch.clamp(ratio, 1.0 - EPSILON, 1.0 + EPSILON) * adv
+            ppo_step_loss = -torch.min(surr1, surr2)
+
+            # Gradient Masking (Bức tường giới hạn)
             block_over_confidence = (step_log_probs > LOG_PROB_MAX) & (adv > 0)
-
-            # 2. Chỉ BỊ CHẶN khi: Đã thấp (< MIN) VÀ vẫn cố dìm GIẢM (adv < 0)
-            # Note: Nếu step_log_probs < MIN nhưng adv > 0 (muốn TĂNG), điều kiện này = False 
-            # -> KHÔNG BỊ CHẶN -> Được phép update tăng lên lại bình thường!
             block_over_penalty = (step_log_probs < LOG_PROB_MIN) & (adv < 0)
-
-            # Tổng hợp các vị trí bị chặn gradient
             saturated_mask = block_over_confidence | block_over_penalty
 
-            # Ngắt gradient tại các vị trí vi phạm hướng
-            effective_log_probs = torch.where(
-                saturated_mask, 
-                step_log_probs.detach(), 
-                step_log_probs
+            # Ngắt gradient tại các vị trí chạm tường mà cố đẩy tiếp
+            effective_step_loss = torch.where(
+                saturated_mask, ppo_step_loss.detach(), ppo_step_loss
             )
 
-            traj_loss = (-effective_log_probs * adv).sum()
-            policy_loss_terms.append(traj_loss)
+            policy_loss_terms.append(effective_step_loss.sum())
 
-        # Gom loss trung bình của cả group
+        # 6. Gom Loss
         policy_loss = torch.stack(policy_loss_terms).mean()
         entropy_bonus = torch.stack(entropy_means).mean()
 
@@ -102,19 +116,23 @@ class GRPOTrainer:
         loss = policy_loss - self.config.entropy_coef * entropy_bonus
 
         # Tính KL Penalty nếu được cấu hình
-        if self.config.kl_coef > 0:
-            kl = batched_kl_penalty(self.policy, self.reference_policy, trajectories, self.device)
+        if getattr(self.config, "kl_coef", 0.0) > 0:
+            kl = batched_kl_penalty(
+                self.policy, self.reference_policy, trajectories, self.device
+            )
             loss = loss + self.config.kl_coef * kl
         else:
             kl = torch.tensor(0.0, device=self.device)
 
-        # Cập nhật Optimizer
+        # 7. Cập nhật Optimizer
         self.optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.config.max_grad_norm)
+        torch.nn.utils.clip_grad_norm_(
+            self.policy.parameters(), self.config.max_grad_norm
+        )
         self.optimizer.step()
 
-        # Log metrics
+        # 8. Log metrics
         success_rate = sum(t.success for t in trajectories) / len(trajectories)
         durations = [t.duration for t in trajectories]
 
