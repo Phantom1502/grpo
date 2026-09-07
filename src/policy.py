@@ -110,7 +110,8 @@ class GaussianMLPPolicy(BasePolicy):
     """
 
     def __init__(self, n_observations: int, action_dim: int, hidden: int = 128,
-                 log_std_init: float = -0.5, action_low: float = -1.0, action_high: float = 1.0):
+                 log_std_init: float = -0.5, action_low: float = -1.0, action_high: float = 1.0,
+                 log_std_min: float = -2.0, log_std_max: float = 2.0):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(n_observations, hidden),
@@ -122,6 +123,13 @@ class GaussianMLPPolicy(BasePolicy):
         self.log_std = nn.Parameter(torch.ones(action_dim) * log_std_init)
         self.action_low = action_low
         self.action_high = action_high
+        # SÀN/TRẦN cho log_std -- đảm bảo exploration KHÔNG BAO GIỜ tắt hẳn dù
+        # gradient có đẩy log_std xuống thấp tới đâu (chống "ngừng khám phá" khi
+        # policy quá tự tin vào 1 hành vi), đồng thời cũng chặn std nổ quá lớn
+        # theo chiều ngược lại (log_std_max). std thực tế luôn nằm trong
+        # [exp(log_std_min), exp(log_std_max)] = [e^-2, e^2] ~ [0.135, 7.39] mặc định.
+        self.log_std_min = log_std_min
+        self.log_std_max = log_std_max
         # TransformedDistribution khong co .entropy() dang dong (vi TanhTransform
         # phi tuyen) -- danh dau de batched_ops biet fallback sang uoc luong
         # entropy qua -log_prob(action) (cach chuan trong cac implementation SAC).
@@ -143,31 +151,44 @@ class GaussianMLPPolicy(BasePolicy):
         # [-clip_mean, clip_mean]), chỉ tự giới hạn khi vượt ngưỡng -- giữ
         # nguyên độ biểu đạt của raw_mean trong vùng bình thường, đồng thời vẫn
         # ngăn được runaway (không thể vượt quá clip_mean dù trọng số lớn cỡ
-        # nào) và vẫn đảm bảo an toàn số học cho TanhTransform bên ngoài (biên
-        # 6.0 giữ tanh() không bao giờ làm tròn về đúng 1.0 ở float32).
-        return torch.clamp(raw_mean, -6.0, 6.0)
+        # nào).
+        #
+        # BIÊN = 3.0 (không phải 6.0): tanh(3)=0.995 vẫn đủ "quyết đoán" (gần
+        # như tối đa), NHƯNG quan trọng hơn -- ở gần biên 3.0, đạo hàm tanh còn
+        # đủ lớn để dù std đã bị ép về sàn tối thiểu (log_std_min), nhiễu Gaussian
+        # SAU tanh vẫn còn spread đáng kể (~400 lần lớn hơn so với biên 6.0). Đây
+        # là lớp phòng vệ THỨ 2 chống collapse -- sàn std (log_std_min) chỉ đảm
+        # bảo nhiễu TRƯỚC tanh không tắt hẳn, nhưng nếu mean nằm quá sâu trong
+        # vùng bão hoà hình học của tanh, nhiễu đó vẫn bị "nén" gần về 0 SAU tanh
+        # dù trước đó lớn thế nào -- hẹp biên mean lại là cách duy nhất giải
+        # quyết đúng cơ chế collapse THỨ HAI này (khác hẳn nguyên nhân sàn std
+        # đang giải quyết).
+        return torch.clamp(raw_mean, -3.0, 3.0)
 
     def get_distribution(self, x):
         mean = self.forward(x)
-        std = torch.exp(self.log_std).expand_as(mean)
+        # Clamp log_std vào [log_std_min, log_std_max] TRƯỚC khi exp() -- đây là
+        # sàn/trần cho std. Quan trọng: phải làm ở ĐÂY (nguồn dùng chung cho cả
+        # get_distribution lẫn get_action bên dưới), không tính riêng std ở 2 nơi
+        # khác nhau -- nếu không dễ bị lệch (sửa 1 chỗ quên chỗ kia).
+        log_std = torch.clamp(self.log_std, self.log_std_min, self.log_std_max)
+        std = torch.exp(log_std).expand_as(mean)
         base = Independent(Normal(mean, std), 1)
         return TransformedDistribution(base, [TanhTransform(cache_size=1)])
 
     def get_action(self, state, deterministic: bool = False):
-        mean = self.forward(state)  # đã bound trong (-1,1) từ forward()
-        std = torch.exp(self.log_std).expand_as(mean)
-        base = Independent(Normal(mean, std), 1)
-        dist = TransformedDistribution(base, [TanhTransform(cache_size=1)])
+        dist = self.get_distribution(state)
+        base = dist.base_dist  # Independent(Normal(mean, std), 1) -- std đã qua sàn/trần ở get_distribution()
 
         if deterministic:
-            pre_tanh = mean
+            pre_tanh = base.mean
         else:
             pre_tanh = base.rsample()
 
-        # Lưới an toàn số học: mean đã bound trong (-1,1), nhưng nhiễu Gaussian
-        # (std) vẫn có thể đẩy sample ra khá xa ở phần đuôi phân phối nếu std bị
-        # học lớn. Clamp nhẹ trước tanh (biên rộng, hiếm khi chạm tới trong vận
-        # hành bình thường) để tránh atanh(±1)=inf ở float32 khi |pre_tanh|>=10.
+        # Lưới an toàn số học: dù std đã có trần (log_std_max), nhiễu Gaussian
+        # vẫn có thể đẩy sample ra khá xa ở phần đuôi phân phối. Clamp nhẹ trước
+        # tanh (biên rộng, hiếm khi chạm tới trong vận hành bình thường) để tránh
+        # atanh(±1)=inf ở float32 khi |pre_tanh|>=10.
         pre_tanh = torch.clamp(pre_tanh, -6.0, 6.0)
         action = torch.tanh(pre_tanh)
 
