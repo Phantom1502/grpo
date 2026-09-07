@@ -55,11 +55,15 @@ class VectorizedGroupSampler:
     def _collect_once(self) -> List[Trajectory]:
         G = self.group_size
         obs, _ = self.vec_env.reset()
-        states = torch.tensor(np.asarray(obs), dtype=torch.float32, device=self.device)
+        states = torch.tensor(
+            np.asarray(obs), dtype=torch.float32, device=self.device
+        )
 
         traj_states: List[list] = [[] for _ in range(G)]
         traj_actions: List[list] = [[] for _ in range(G)]
         traj_rewards: List[list] = [[] for _ in range(G)]
+        traj_log_probs: List[list] = [[] for _ in range(G)]  # <--- Thêm lưu log_probs
+
         active = np.ones(G, dtype=bool)
         term_flags = np.zeros(G, dtype=bool)
         trunc_flags = np.zeros(G, dtype=bool)
@@ -68,37 +72,50 @@ class VectorizedGroupSampler:
             if not active.any():
                 break
 
-            # 1 forward pass DUY NHẤT xử lý toàn bộ group -> đây là điểm tối ưu chính.
-            # get_distribution() tổng quát cho cả discrete (Categorical) lẫn
-            # continuous (Independent Normal) -- Sampler không cần biết loại nào.
+            # 1. Forward pass batched duy nhất thu được phân phối
             dist = self.policy.get_distribution(states)
             actions = dist.sample()
+
+            # 2. Tính log_prob cho toàn bộ batch [G]
+            log_probs = dist.log_prob(actions)
+
             actions_np = actions.detach().cpu().numpy()
+            next_obs, rewards, terminated, truncated, _infos = self.vec_env.step(
+                actions_np
+            )
 
-            next_obs, rewards, terminated, truncated, _infos = self.vec_env.step(actions_np)
-
+            # 3. Phân bổ dữ liệu về từng trajectory tương ứng
             for i in range(G):
                 if active[i]:
                     traj_states[i].append(states[i].cpu())
                     traj_actions[i].append(actions[i].detach().cpu())
+                    traj_log_probs[i].append(
+                        log_probs[i].detach().cpu()
+                    )  # <--- Trích xuất log_prob step của env i
                     traj_rewards[i].append(float(rewards[i]))
+
                     if terminated[i] or truncated[i]:
                         active[i] = False
                         term_flags[i] = bool(terminated[i])
                         trunc_flags[i] = bool(truncated[i])
 
-            states = torch.tensor(np.asarray(next_obs), dtype=torch.float32, device=self.device)
+            states = torch.tensor(
+                np.asarray(next_obs), dtype=torch.float32, device=self.device
+            )
 
         trajectories = []
         for i in range(G):
             duration = len(traj_rewards[i])
             total_reward = float(sum(traj_rewards[i]))
-            success = self.task.success_fn(total_reward, duration, term_flags[i], trunc_flags[i], {})
+            success = self.task.success_fn(
+                total_reward, duration, term_flags[i], trunc_flags[i], {}
+            )
             trajectories.append(
                 Trajectory(
                     rewards=traj_rewards[i],
                     states=traj_states[i],
                     actions=traj_actions[i],
+                    log_probs=traj_log_probs[i],  # <--- Gắn log_probs vào Trajectory
                     duration=duration,
                     success=success,
                 )
